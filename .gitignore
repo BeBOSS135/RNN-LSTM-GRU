@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+*.log
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
