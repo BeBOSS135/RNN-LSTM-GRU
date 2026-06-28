@@ -18,9 +18,8 @@ from tensorflow.keras.callbacks import EarlyStopping, Callback
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import CosineDecay
 
-DATA_DIR = './'
+#DATA_DIR = './'
 os.makedirs("figures", exist_ok=True)
-os.makedirs("tf_cache", exist_ok=True) #Disk Caching Directory
 
 # TF32 and Mixed Precision to Maximize Speed
 # Save VRAM Eventhoug it is Not Needed
@@ -46,23 +45,27 @@ CNN_POOL     = 2
 # Dropout to Avoid Overfitting
 UNITS_L1     = 128
 UNITS_L2     = 64
-DROPOUT      = 0.2
+DROPOUT      = 0.3
 
 # Weighted Penalty for Class Imbalance
-ACTIVE_WEIGHT = 3.0
-HUBER_DELTA   = 1.0
+ACTIVE_WEIGHT = 5.0
+HUBER_DELTA   = 0.5
 
 # Warmup for Stable Initial Wweight Updates
 # 128 Batch Size to Optimize GPU Memory (through testing)
 # Parallel Batch Execution with steps_per_execution=16 to Reduce Overhead
 EPOCHS         = 100
 PATIENCE_ES    = 5
-WARMUP_FRAC    = 0.05
+MIN_EPOCHS     = 30   
+MIN_DELTA_ES   = 1e-4  
+                
+WARMUP_FRAC    = 0.10 
 INIT_LR        = 1e-3 # 1.5e-6 from LR Finder NOT Worth the Extra Training Time, Didnt Improve Performance in the 100 Epochs Training Window
 MIN_LR         = 1e-6 # 1e-7
 CLIP_NORM      = 1.0
 BATCH_SIZE     = 128
-STEPS_PER_EXEC = 16     
+EVAL_BATCH     = 512    
+STEPS_PER_EXEC = 16
 NOISE_INIT     = 0.02   
 
 TRAIN_RATIO = 0.70
@@ -79,11 +82,11 @@ max_agg = float(np.loadtxt(os.path.join(DATA_DIR, 'CoffeeMachinemaxAgg.txt')))
 max_app = float(np.loadtxt(os.path.join(DATA_DIR, 'CoffeeMachinemaxApp.txt')))
 print(f"  max_agg = {max_agg:.2f} W   max_app = {max_app:.2f} W")
 
-X_raw = np.loadtxt(os.path.join(DATA_DIR, 'Input_Data.txt'),  delimiter=',')
-y_raw = np.loadtxt(os.path.join(DATA_DIR, 'Output_Data.txt'), delimiter=',')
+#Loading Straight to float32 to Avoid Casting Overhead in the GPU Pipeline
+X_raw = pd.read_csv(os.path.join(DATA_DIR, 'Input_Data.txt'),  header=None).to_numpy(np.float32)
+y_raw = pd.read_csv(os.path.join(DATA_DIR, 'Output_Data.txt'), header=None).to_numpy(np.float32)
 
 n_samples, time_steps = X_raw.shape
-features = 1
 MINUTES  = np.arange(time_steps)
 
 print(f"  Dataset : {n_samples} sequences × {time_steps} timesteps")
@@ -125,11 +128,13 @@ for i, idx in enumerate(chosen, 1):
 
 # Normalisation and Splitting
 print("\n3. Normalising & Splitting")
-X_norm = np.clip(X_raw / max_agg, 0.0, 1.0).astype('float32')
-y_norm = np.clip(y_raw / max_app, 0.0, 1.0).astype('float32')
-
+# Inputs may be floored at 0 (aggregate power is non-negative).
+X_norm  = np.clip(X_raw, 0.0, None)
+y_norm  = y_raw
+dX_norm = np.diff(X_norm, axis=1, prepend=X_norm[:, :1]) 
+features = 2  # aggregate + derivative
 # Constants for Loss Function Calculation
-ACTIVE_THRESHOLD = tf.constant(5.0 / max_app,  dtype=tf.float32)
+ACTIVE_THRESHOLD = tf.constant(0.0046, dtype=tf.float32)
 _ACTIVE_WEIGHT   = tf.constant(ACTIVE_WEIGHT,   dtype=tf.float32)
 _HUBER_DELTA     = tf.constant(HUBER_DELTA,     dtype=tf.float32)
 
@@ -147,45 +152,55 @@ train_idx = np.concatenate([a_tr, i_tr]); rng.shuffle(train_idx)
 val_idx   = np.concatenate([a_va, i_va]); rng.shuffle(val_idx)
 test_idx  = np.concatenate([a_te, i_te]); rng.shuffle(test_idx)
 
-def extract_split(arr, idx):
-    return arr[idx, :, np.newaxis]
+def extract_split_X(idx):
+    return np.stack([X_norm[idx], dX_norm[idx]], axis=-1)  
 
-X_train, X_val, X_test = (extract_split(X_norm, train_idx), extract_split(X_norm, val_idx), extract_split(X_norm, test_idx))
-y_train, y_val, y_test = (extract_split(y_norm, train_idx), extract_split(y_norm, val_idx), extract_split(y_norm, test_idx))
+def extract_split_y(arr, idx):
+    return arr[idx, :, np.newaxis]                         
+
+X_train = extract_split_X(train_idx)
+X_val   = extract_split_X(val_idx)
+X_test  = extract_split_X(test_idx)
+y_train = extract_split_y(y_norm, train_idx)
+y_val   = extract_split_y(y_norm, val_idx)
+y_test  = extract_split_y(y_norm, test_idx)
 
 # Performance Optimization
 # Perfetch to Allow CPU to Prepare Next Batches While GPU Processes Current Ones
-def make_dataset(X, y, training=False, cache_name=""):
+def make_dataset(X, y, training=False, batch_size=BATCH_SIZE):
     ds = tf.data.Dataset.from_tensor_slices((X, y))
-    
-    # Disk Caching Instead of Ram
-    if cache_name:
-        cache_path = os.path.join("tf_cache", cache_name)
-        ds = ds.cache(cache_path)
-    else:
-        ds = ds.cache()
-        
+
     if training:
         ds = ds.shuffle(len(X), seed=SEED, reshuffle_each_iteration=True)
-        
-    return ds.batch(BATCH_SIZE, drop_remainder=training).prefetch(tf.data.AUTOTUNE)
+
+    # Drop Remainder Only During Training - Uniform Batch Size Required for steps_per_execution and XLA
+    return ds.batch(batch_size, drop_remainder=training).prefetch(tf.data.AUTOTUNE)
 
 # Custom Weighted Huber Loss
 # Create Mask for Active States to Handle Class Imbalance
 # Huber Loss for Robustness Against Signal Outliers
 def weighted_huber(y_true, y_pred):
-    active_mask = tf.cast(y_true > ACTIVE_THRESHOLD, tf.float32)
-    weights     = 1.0 + (_ACTIVE_WEIGHT - 1.0) * active_mask
-    err         = y_true - y_pred
-    abs_err     = tf.abs(err)
-    huber_elem  = tf.where(abs_err <= _HUBER_DELTA, 0.5 * tf.square(err), _HUBER_DELTA * (abs_err - 0.5 * _HUBER_DELTA))
-    return tf.reduce_mean(weights * huber_elem)
+    active_mask  = tf.cast(y_true > ACTIVE_THRESHOLD, tf.float32)
+    weights      = 1.0 + (_ACTIVE_WEIGHT - 1.0) * active_mask
+    err          = y_true - y_pred
+    abs_err      = tf.abs(err)
+    huber_elem   = tf.where(
+        abs_err <= _HUBER_DELTA,
+        0.5 * tf.square(err),
+        _HUBER_DELTA * (abs_err - 0.5 * _HUBER_DELTA)
+    )
+    # Scale Penalty by Signal Magnitude - High Wattage Events Punished More for Underprediction
+    underpredict_penalty = tf.cast(err > 0, tf.float32) * active_mask * abs_err * (1.0 + 2.0 * y_true)
+    inactive_mask        = 1.0 - active_mask
+    sparsity_penalty     = 0.6 * inactive_mask * tf.abs(y_pred)
+    return tf.reduce_mean(weights * huber_elem + underpredict_penalty + sparsity_penalty)
 
 # Cosine Decay LR With Linear Warmup
 # Linear Warmup to Stabilize Gradients
 # Cosine Decay for Optimal Convergence
+LR_DECAY_EPOCHS = 40
 steps_per_epoch = len(train_idx) // BATCH_SIZE
-total_steps     = EPOCHS * steps_per_epoch
+total_steps     = LR_DECAY_EPOCHS * steps_per_epoch
 warmup_steps    = max(1, int(total_steps * WARMUP_FRAC))
 decay_steps     = total_steps - warmup_steps
 
@@ -214,10 +229,10 @@ class DynamicNoiseLayer(layers.Layer):
     def call(self, inputs, training=None):
         if training:
             noise = tf.random.normal(tf.shape(inputs), stddev=noise_std_var, dtype=tf.float32)
-            noise = tf.cast(noise, inputs.dtype)  # cast σε float16
-            return tf.clip_by_value(inputs + noise, 
-                                    tf.cast(0.0, inputs.dtype), 
-                                    tf.cast(1.0, inputs.dtype))
+            noise = tf.cast(noise, inputs.dtype)
+            noisy = inputs + noise
+            agg = tf.maximum(noisy[..., 0:1], tf.cast(0.0, inputs.dtype))
+            return tf.concat([agg, noisy[..., 1:]], axis=-1)
         return inputs
 
 #Decrease Noise Linearly Over Epochs to Allow Fine Tuning in Later Stages
@@ -225,6 +240,17 @@ class NoiseDecayCallback(Callback):
     def on_epoch_begin(self, epoch, logs=None):
         new_noise = NOISE_INIT * (1.0 - (epoch / EPOCHS))
         noise_std_var.assign(max(0.0, new_noise))
+
+# start_from_epoch Only Works with Newer Keras and TF Versions
+class EarlyStoppingMinEpochs(EarlyStopping):
+    def __init__(self, start_epoch=0, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = start_epoch
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch < self.start_epoch:
+            return  
+        super().on_epoch_end(epoch, logs)
 
 # Learning Rate Finder Callback to Map Ideal Learning Rate Range
 class LRFinder(Callback):
@@ -284,17 +310,16 @@ def _build_model(rnn_class, name, lr_schedule):
     # Residual/Skip Connection to Preserve Unfiltered CNN Features
     skip = layers.Conv1D(UNITS_L2 * 2, 1, padding='same', name='skip_proj')(cnn_out)
     x    = layers.Add(name='residual')([x, skip])
-
-    # Regression Head for Final Power Output Prediction
     x   = layers.TimeDistributed(layers.Dense(32, activation='relu'))(x)
-    out = layers.TimeDistributed(layers.Dense(1, activation='sigmoid', dtype='float32'), name='output')(x)
+    # Softplus Over ReLU: Smooth at Zero, Never Exactly Zero, Unbounded Above
+    out = layers.TimeDistributed(layers.Dense(1, activation='softplus', dtype='float32'), name='output')(x)
 
     model = models.Model(inp, out, name=f'{name}_model')
     
-    # XLA ONLY! for RNN
-    use_xla = True if name == 'RNN' else False  
-    model.compile(optimizer=Adam(learning_rate=lr_schedule, clipnorm=CLIP_NORM), 
-                  loss=weighted_huber, metrics=['mae'], 
+    # XLA Only for RNN - LSTM and GRU Have Dedicated cuDNN Kernels That Outperform XLA
+    use_xla = (name == 'RNN')
+    model.compile(optimizer=Adam(learning_rate=lr_schedule, clipnorm=CLIP_NORM),
+                  loss=weighted_huber, metrics=['mae'],
                   steps_per_execution=STEPS_PER_EXEC, jit_compile=use_xla)
     return model
 
@@ -316,7 +341,7 @@ predictions_train = {}
 if RUN_LR_FINDER:
     print("\nRUNNING LR FINDER (RNN Model)")
     K.clear_session()
-    ds_train_lr = make_dataset(X_train, y_train, training=True, cache_name="train_lr_cache")
+    ds_train_lr = make_dataset(X_train, y_train, training=True)
     model_lr = create_rnn(1e-6) 
     lr_finder = LRFinder(steps=steps_per_epoch * 2)
     model_lr.fit(ds_train_lr, epochs=2, callbacks=[lr_finder], verbose=0)
@@ -338,16 +363,17 @@ for name, factory in factories.items():
     K.clear_session()
     
     # Instantiate Datasets Inside Loop for Safe Session Clearing
-    ds_train      = make_dataset(X_train, y_train, training=True, cache_name=f"train_cache_{name}")
-    ds_val        = make_dataset(X_val,   y_val, cache_name=f"val_cache_{name}")
-    ds_test       = make_dataset(X_test,  y_test, cache_name=f"test_cache_{name}")
-    ds_train_eval = make_dataset(X_train, y_train, training=False, cache_name=f"train_eval_cache_{name}")
+    ds_train      = make_dataset(X_train, y_train, training=True)
+    ds_val        = make_dataset(X_val,   y_val)
+    ds_test       = make_dataset(X_test,  y_test, batch_size=EVAL_BATCH)
+    ds_train_eval = make_dataset(X_train, y_train, training=False, batch_size=EVAL_BATCH)
     
     lr_schedule = make_lr_schedule()
     model = factory(lr_schedule)
 
     cbs = [
-        EarlyStopping(monitor='val_loss', patience=PATIENCE_ES, restore_best_weights=True, verbose=1),
+        EarlyStoppingMinEpochs(start_epoch=MIN_EPOCHS, monitor='val_loss', patience=PATIENCE_ES,
+                               min_delta=MIN_DELTA_ES, restore_best_weights=True, verbose=1),
         NoiseDecayCallback()
     ]
 
@@ -390,60 +416,72 @@ all_errors_train = {}
 for name in factories:
     rmse_te, mae_te, maxerr_te = vectorised_errors(y_test, predictions_test[name], max_app)
     all_errors_test[name]  = {'RMSE': rmse_te, 'MAE': mae_te, 'MaxErr': maxerr_te}
-    
+
     rmse_tr, mae_tr, maxerr_tr = vectorised_errors(y_train, predictions_train[name], max_app)
     all_errors_train[name] = {'RMSE': rmse_tr, 'MAE': mae_tr, 'MaxErr': maxerr_tr}
 
-# Ensemble Weights Based on Validation Loss 
+# Zero Prediction if Aggregate Below 5% of Max - Appliance Cannot Be On
+AGG_GATE = 0.05
+agg_test_ch  = X_test[:, :, 0:1]
+agg_train_ch = X_train[:, :, 0:1]
+
+# Suppress Predictions in First 3 Timesteps Unless Startup Ramp Detected
+ONSET_GUARD  = 3
+# Minimum Derivative to Count as an Appliance Turn-On Event
+DX_ONSET_MIN = 0.05
+agg_dx_test  = X_test[:, :, 1:2]  
+agg_dx_train = X_train[:, :, 1:2]
+
+def apply_postproc_gates(pred, agg_ch, dx_ch):
+    pred = np.where(agg_ch < AGG_GATE, 0.0, pred)
+    pred[:, :ONSET_GUARD, :] = np.where(
+        dx_ch[:, :ONSET_GUARD, :] < DX_ONSET_MIN, 0.0, pred[:, :ONSET_GUARD, :])
+    return pred
+
+for name in factories:
+    predictions_test[name]  = apply_postproc_gates(predictions_test[name],  agg_test_ch,  agg_dx_test)
+    predictions_train[name] = apply_postproc_gates(predictions_train[name], agg_train_ch, agg_dx_train)
+
+# Ensemble Weights Based on Validation Loss
 best_val_losses = {name: min(histories[name].history['val_loss']) for name in factories}
 inv_losses = {name: 1.0 / loss for name, loss in best_val_losses.items()}
 sum_inv = sum(inv_losses.values())
 weights = {name: inv / sum_inv for name, inv in inv_losses.items()}
 
 # Ensemble Test
-pred_ensemble_te = (predictions_test['RNN']  * weights['RNN'] + predictions_test['LSTM'] * weights['LSTM'] + predictions_test['GRU']  * weights['GRU'])
+pred_ensemble_te = sum(predictions_test[n] * weights[n] for n in factories)
+pred_ensemble_te = apply_postproc_gates(pred_ensemble_te, agg_test_ch, agg_dx_test)
 ens_rmse_te, ens_mae_te, ens_maxerr_te = vectorised_errors(y_test, pred_ensemble_te, max_app)
 all_errors_test['Ensemble'] = {'RMSE': ens_rmse_te, 'MAE': ens_mae_te, 'MaxErr': ens_maxerr_te}
 predictions_test['Ensemble'] = pred_ensemble_te
 
 # Ensemble Train
-pred_ensemble_tr = (predictions_train['RNN'] * weights['RNN'] + predictions_train['LSTM'] * weights['LSTM'] + predictions_train['GRU'] * weights['GRU'])
+pred_ensemble_tr = sum(predictions_train[n] * weights[n] for n in factories)
+pred_ensemble_tr = apply_postproc_gates(pred_ensemble_tr, agg_train_ch, agg_dx_train)
 ens_rmse_tr, ens_mae_tr, ens_maxerr_tr = vectorised_errors(y_train, pred_ensemble_tr, max_app)
 all_errors_train['Ensemble'] = {'RMSE': ens_rmse_tr, 'MAE': ens_mae_tr, 'MaxErr': ens_maxerr_tr}
 
 all_model_names = list(factories.keys()) + ['Ensemble']
 
-# Bar Charts 
+# Bar Charts
 x = np.arange(len(all_model_names))
-mae_means = [all_errors_test[m]['MAE'].mean() for m in all_model_names]
-mae_stds  = [all_errors_test[m]['MAE'].std() for m in all_model_names]
-rmse_means = [all_errors_test[m]['RMSE'].mean() for m in all_model_names]
-rmse_stds  = [all_errors_test[m]['RMSE'].std() for m in all_model_names]
-maxerr_means = [all_errors_test[m]['MaxErr'].mean() for m in all_model_names]
-maxerr_stds  = [all_errors_test[m]['MaxErr'].std() for m in all_model_names]
-
-# Prevents Negative Values
-mae_err = [np.minimum(mae_means, mae_stds), mae_stds]
-rmse_err = [np.minimum(rmse_means, rmse_stds), rmse_stds]
-maxerr_err = [np.minimum(maxerr_means, maxerr_stds), maxerr_stds]
+bar_specs = [
+    ('MAE',    'Mean Absolute Error (MAE) - Test',     '#4c72b0'),
+    ('RMSE',   'Root Mean Square Error (RMSE) - Test', '#dd8452'),
+    ('MaxErr', 'Maximum Error (MaxErr) - Test',        '#55a868'),
+]
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-axes[0].bar(x, mae_means, width=0.5, yerr=mae_err, capsize=4, color='#4c72b0')
-axes[0].set_title('Mean Absolute Error (MAE) - Test')
+for ax, (metric, title, color) in zip(axes, bar_specs):
+    means = [all_errors_test[m][metric].mean() for m in all_model_names]
+    stds  = [all_errors_test[m][metric].std()  for m in all_model_names]
+    # Prevents Negative Values
+    yerr  = [np.minimum(means, stds), stds]
+    ax.bar(x, means, width=0.5, yerr=yerr, capsize=4, color=color)
+    ax.set_title(title)
+    ax.set_xticks(x); ax.set_xticklabels(all_model_names, rotation=15)
+    ax.set_ylim(bottom=0)
 axes[0].set_ylabel('Watts')
-axes[0].set_xticks(x); axes[0].set_xticklabels(all_model_names, rotation=15)
-axes[0].set_ylim(bottom=0)
-
-axes[1].bar(x, rmse_means, width=0.5, yerr=rmse_err, capsize=4, color='#dd8452')
-axes[1].set_title('Root Mean Square Error (RMSE) - Test')
-axes[1].set_xticks(x); axes[1].set_xticklabels(all_model_names, rotation=15)
-axes[1].set_ylim(bottom=0)
-
-axes[2].bar(x, maxerr_means, width=0.5, yerr=maxerr_err, capsize=4, color='#55a868')
-axes[2].set_title('Maximum Error (MaxErr) - Test')
-axes[2].set_xticks(x); axes[2].set_xticklabels(all_model_names, rotation=15)
-axes[2].set_ylim(bottom=0)
 
 plt.tight_layout()
 plt.savefig('figures/Performance_BarCharts_Separated.png')
